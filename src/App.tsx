@@ -1,7 +1,8 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
+  ViewportPortal,
   useReactFlow,
   addEdge,
   applyNodeChanges,
@@ -189,6 +190,7 @@ function createComponentSnapshot(
   return {
     id,
     name,
+    sourceSeedNodeId: seedNodeId,
     nodes: circuit.nodes.map((node) => ({
       ...node,
       selected: false,
@@ -215,6 +217,48 @@ function createComponentSnapshot(
   };
 }
 
+function attachLatestComponents(
+  nodes: Node[],
+  components: SavedComponent[],
+): Node[] {
+  const componentsById = new Map(
+    components.map((component) => [component.id, component]),
+  );
+  return nodes.map((node) => {
+    if (node.type !== "component") return node;
+    const existing = node.data?.component as SavedComponent | undefined;
+    const latest = existing ? componentsById.get(existing.id) : undefined;
+    return latest && latest !== existing
+      ? { ...node, data: { ...node.data, component: latest } }
+      : node;
+  });
+}
+
+function removeInvalidComponentEdges(edges: Edge[], nodes: Node[]): Edge[] {
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  return edges.filter((edge) => {
+    const source = nodesById.get(edge.source);
+    if (source?.type === "component") {
+      const component = source.data?.component as SavedComponent | undefined;
+      const outputId = edge.sourceHandle?.startsWith("output:")
+        ? edge.sourceHandle.slice("output:".length)
+        : "";
+      if (!component?.outputs.some((port) => port.id === outputId))
+        return false;
+    }
+
+    const target = nodesById.get(edge.target);
+    if (target?.type === "component") {
+      const component = target.data?.component as SavedComponent | undefined;
+      const inputId = edge.targetHandle?.startsWith("input:")
+        ? edge.targetHandle.slice("input:".length)
+        : "";
+      if (!component?.inputs.some((port) => port.id === inputId)) return false;
+    }
+    return true;
+  });
+}
+
 let idCounter = initialWorkspace.nodes.reduce((max, node) => {
   const match = node.id.match(/_(\d+)$/);
   return match ? Math.max(max, Number(match[1])) : max;
@@ -225,6 +269,34 @@ function CircuitFlow() {
   const [edges, setEdges] = useState<Edge[]>(initialWorkspace.edges);
   const [savedComponents, setSavedComponents] = useState<SavedComponent[]>(
     initialWorkspace.savedComponents,
+  );
+  const liveSavedComponents = useMemo(
+    () =>
+      savedComponents.map((component) => {
+        const seedNodeId = component.sourceSeedNodeId;
+        if (!seedNodeId || !nodes.some((node) => node.id === seedNodeId)) {
+          return component;
+        }
+        const snapshot = createComponentSnapshot(
+          component.id,
+          component.name,
+          seedNodeId,
+          nodes,
+          edges,
+        );
+        return JSON.stringify(snapshot) === JSON.stringify(component)
+          ? component
+          : snapshot;
+      }),
+    [edges, nodes, savedComponents],
+  );
+  const renderedNodes = useMemo(
+    () => attachLatestComponents(nodes, liveSavedComponents),
+    [liveSavedComponents, nodes],
+  );
+  const liveEdges = useMemo(
+    () => removeInvalidComponentEdges(edges, renderedNodes),
+    [edges, renderedNodes],
   );
   const [componentMenu, setComponentMenu] = useState<{
     x: number;
@@ -246,26 +318,26 @@ function CircuitFlow() {
   const edgesRef = useRef(edges);
 
   useEffect(() => {
-    nodesRef.current = nodes;
-  }, [nodes]);
+    nodesRef.current = renderedNodes;
+  }, [renderedNodes]);
 
   useEffect(() => {
-    edgesRef.current = edges;
-  }, [edges]);
+    edgesRef.current = liveEdges;
+  }, [liveEdges]);
 
   useEffect(() => {
     const workspace: PersistedWorkspace = {
-      nodes: nodes.map((node) => ({
+      nodes: renderedNodes.map((node) => ({
         ...node,
         selected: false,
         dragging: false,
       })),
-      edges,
-      savedComponents,
+      edges: liveEdges,
+      savedComponents: liveSavedComponents,
       lastOutputs: Array.from(lastOutputsRef.current.entries()),
     };
     localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(workspace));
-  }, [edges, nodes, savedComponents]);
+  }, [liveEdges, liveSavedComponents, renderedNodes]);
 
   const clockConfigKey = JSON.stringify(
     nodes
@@ -278,7 +350,11 @@ function CircuitFlow() {
 
   const saveConnectedComponent = useCallback(
     (seedNodeId: string) => {
-      const connectedCircuit = getConnectedCircuit(seedNodeId, nodes, edges);
+      const connectedCircuit = getConnectedCircuit(
+        seedNodeId,
+        renderedNodes,
+        liveEdges,
+      );
       if (connectedCircuit.nodes.length === 0) return;
 
       setElementMenu(null);
@@ -289,13 +365,13 @@ function CircuitFlow() {
         `component_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         name.trim(),
         seedNodeId,
-        nodes,
-        edges,
+        renderedNodes,
+        liveEdges,
       );
       setSavedComponents((current) => [...current, component]);
       setElementMenu(null);
     },
-    [edges, nodes],
+    [liveEdges, renderedNodes],
   );
 
   const onNodeContextMenu = useCallback(
@@ -327,29 +403,28 @@ function CircuitFlow() {
     [],
   );
 
-  const toggleInputValues = useCallback(
-    (ids: string[]) => {
-      const idsToToggle = new Set(ids);
-      const currentNodes = nodesRef.current;
-      const updatedNodes = currentNodes.map((node) =>
-        idsToToggle.has(node.id) && (node.type === "input" || node.type === "clock")
-          ? { ...node, data: { ...node.data, value: !node.data?.value } }
-          : node,
-      );
-      if (updatedNodes.every((node, index) => node === currentNodes[index])) return;
-      const result = simulateCircuitWithComponents(
-        updatedNodes,
-        edgesRef.current,
-        lastOutputsRef.current,
-      );
-      lastOutputsRef.current = result.outputs;
-      nodesRef.current = result.nodes;
-      edgesRef.current = result.edges;
-      setNodes(result.nodes);
-      setEdges(result.edges);
-    },
-    [],
-  );
+  const toggleInputValues = useCallback((ids: string[]) => {
+    const idsToToggle = new Set(ids);
+    const currentNodes = nodesRef.current;
+    const updatedNodes = currentNodes.map((node) =>
+      idsToToggle.has(node.id) &&
+      (node.type === "input" || node.type === "clock")
+        ? { ...node, data: { ...node.data, value: !node.data?.value } }
+        : node,
+    );
+    if (updatedNodes.every((node, index) => node === currentNodes[index]))
+      return;
+    const result = simulateCircuitWithComponents(
+      updatedNodes,
+      edgesRef.current,
+      lastOutputsRef.current,
+    );
+    lastOutputsRef.current = result.outputs;
+    nodesRef.current = result.nodes;
+    edgesRef.current = result.edges;
+    setNodes(result.nodes);
+    setEdges(result.edges);
+  }, []);
 
   const toggleInputValue = useCallback(
     (id: string) => toggleInputValues([id]),
@@ -395,6 +470,14 @@ function CircuitFlow() {
     );
   }, []);
 
+  const renameComponent = useCallback((componentId: string, name: string) => {
+    setSavedComponents((current) =>
+      current.map((component) =>
+        component.id === componentId ? { ...component, name } : component,
+      ),
+    );
+  }, []);
+
   const onNodesChange: OnNodesChange = useCallback(
     (changes) => {
       setNodes((nodesSnapshot) => {
@@ -405,13 +488,13 @@ function CircuitFlow() {
             .map((change) => change.id),
         );
         if (removedNodeIds.size > 0) {
-          const remainingEdges = edges.filter(
+          const remainingEdges = liveEdges.filter(
             (edge) =>
               !removedNodeIds.has(edge.source) &&
               !removedNodeIds.has(edge.target),
           );
           const result = simulateCircuitWithComponents(
-            nextNodes,
+            attachLatestComponents(nextNodes, liveSavedComponents),
             remainingEdges,
             lastOutputsRef.current,
           );
@@ -422,52 +505,46 @@ function CircuitFlow() {
         return nextNodes;
       });
     },
-    [edges],
+    [liveEdges, liveSavedComponents],
   );
 
   const onEdgesChange: OnEdgesChange = useCallback(
     (changes) => {
-      setEdges((edgesSnapshot) => {
-        const nextEdges = applyEdgeChanges(changes, edgesSnapshot);
-        const hasRemove = changes.some((c) => c.type === "remove");
-        if (hasRemove) {
-          setNodes((currentNodes) => {
-            const result = simulateCircuitWithComponents(
-              currentNodes,
-              nextEdges,
-              lastOutputsRef.current,
-            );
-            lastOutputsRef.current = result.outputs;
-            return result.nodes;
-          });
-        }
-        return hasRemove
-          ? simulateCircuitWithComponents(
-              nodes,
-              nextEdges,
-              lastOutputsRef.current,
-            ).edges
-          : nextEdges;
-      });
-    },
-    [nodes],
-  );
-
-  const onConnect: OnConnect = useCallback(
-    (params) => {
-      setEdges((edgesSnapshot) => {
-        const nextEdges = addEdge(params, edgesSnapshot);
+      const nextEdges = applyEdgeChanges(changes, liveEdges);
+      if (changes.some((change) => change.type === "remove")) {
         const result = simulateCircuitWithComponents(
-          nodes,
+          renderedNodes,
           nextEdges,
           lastOutputsRef.current,
         );
         lastOutputsRef.current = result.outputs;
+        nodesRef.current = result.nodes;
+        edgesRef.current = result.edges;
         setNodes(result.nodes);
-        return result.edges;
-      });
+        setEdges(result.edges);
+        return;
+      }
+      edgesRef.current = nextEdges;
+      setEdges(nextEdges);
     },
-    [nodes],
+    [liveEdges, renderedNodes],
+  );
+
+  const onConnect: OnConnect = useCallback(
+    (params) => {
+      const nextEdges = addEdge(params, liveEdges);
+      const result = simulateCircuitWithComponents(
+        renderedNodes,
+        nextEdges,
+        lastOutputsRef.current,
+      );
+      lastOutputsRef.current = result.outputs;
+      nodesRef.current = result.nodes;
+      edgesRef.current = result.edges;
+      setNodes(result.nodes);
+      setEdges(result.edges);
+    },
+    [liveEdges, renderedNodes],
   );
 
   const onDragStart = (event: React.DragEvent, type: string) => {
@@ -499,7 +576,7 @@ function CircuitFlow() {
       });
 
       const savedComponent = type.startsWith("component:")
-        ? savedComponents.find(
+        ? liveSavedComponents.find(
             (component) => component.id === type.slice("component:".length),
           )
         : undefined;
@@ -523,18 +600,65 @@ function CircuitFlow() {
             : { value: false },
       };
 
-      const nextNodes = nodes.concat(newNode);
+      const nextNodes = renderedNodes.concat(newNode);
       const result = simulateCircuitWithComponents(
         nextNodes,
-        edges,
+        liveEdges,
         lastOutputsRef.current,
       );
       lastOutputsRef.current = result.outputs;
+      nodesRef.current = result.nodes;
+      edgesRef.current = result.edges;
       setNodes(result.nodes);
       setEdges(result.edges);
     },
-    [nodes, edges, savedComponents, screenToFlowPosition],
+    [renderedNodes, liveEdges, liveSavedComponents, screenToFlowPosition],
   );
+
+  const componentGroups = liveSavedComponents.flatMap((component) => {
+    const seedNodeId = component.sourceSeedNodeId;
+    if (!seedNodeId || !nodes.some((node) => node.id === seedNodeId)) return [];
+    const circuit = getConnectedCircuit(seedNodeId, nodes, edges);
+    if (circuit.nodes.length === 0) return [];
+
+    const bounds = circuit.nodes.reduce(
+      (rect, node) => {
+        const width =
+          node.measured?.width ??
+          node.width ??
+          NODE_DIMENSIONS[node.type ?? ""]?.width ??
+          (node.type === "component"
+            ? COMPONENT_DIMENSION.width
+            : DEFAULT_DIMENSION.width);
+        const height =
+          node.measured?.height ??
+          node.height ??
+          NODE_DIMENSIONS[node.type ?? ""]?.height ??
+          (node.type === "component"
+            ? COMPONENT_DIMENSION.height
+            : DEFAULT_DIMENSION.height);
+        return {
+          left: Math.min(rect.left, node.position.x),
+          top: Math.min(rect.top, node.position.y),
+          right: Math.max(rect.right, node.position.x + width),
+          bottom: Math.max(rect.bottom, node.position.y + height),
+        };
+      },
+      { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity },
+    );
+    const padding = 24;
+    const titleHeight = 30;
+    return [
+      {
+        id: component.id,
+        name: component.name,
+        left: bounds.left - padding,
+        top: bounds.top - padding - titleHeight,
+        width: bounds.right - bounds.left + padding * 2,
+        height: bounds.bottom - bounds.top + padding * 2 + titleHeight,
+      },
+    ];
+  });
 
   return (
     <CircuitContext.Provider value={{ toggleInputValue }}>
@@ -566,7 +690,7 @@ function CircuitFlow() {
                 )}
               </div>
             ))}
-            {savedComponents.map((component) => (
+            {liveSavedComponents.map((component) => (
               <div
                 key={component.id}
                 title={component.name}
@@ -615,8 +739,8 @@ function CircuitFlow() {
         >
           <ReactFlow
             nodeTypes={nodeTypes}
-            nodes={nodes}
-            edges={edges}
+            nodes={renderedNodes}
+            edges={liveEdges}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
@@ -628,7 +752,35 @@ function CircuitFlow() {
             }}
             fitView
             fitViewOptions={{ padding: 0.2 }}
-          />
+          >
+            <ViewportPortal>
+              {componentGroups.map((group) => (
+                <div
+                  key={group.id}
+                  className="pointer-events-none absolute rounded-xl border-2 border-dashed border-indigo-500/80"
+                  style={{
+                    left: group.left,
+                    top: group.top,
+                    width: group.width,
+                    height: group.height,
+                    zIndex: 0,
+                  }}
+                >
+                  <input
+                    aria-label="コンポーネント名"
+                    className="nodrag nopan pointer-events-auto absolute -top-10 left-3 w-40 px-2 py-1 text-xl font-semibold hover:border hover:border-gray-300 text-indigo-500 focus:border-indigo-500 focus:outline-none"
+                    value={group.name}
+                    onChange={(event) =>
+                      renameComponent(group.id, event.target.value)
+                    }
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => event.stopPropagation()}
+                    onKeyDown={(event) => event.stopPropagation()}
+                  />
+                </div>
+              ))}
+            </ViewportPortal>
+          </ReactFlow>
           {elementMenu && (
             <div
               className="fixed z-[1000] min-w-48 rounded border border-gray-300 bg-white py-1 shadow-lg"
@@ -637,7 +789,7 @@ function CircuitFlow() {
               onClick={(event) => event.stopPropagation()}
             >
               {elementMenu.targetType === "node" &&
-                nodes.find(
+                renderedNodes.find(
                   (node) => node.id === elementMenu.id && node.type === "clock",
                 ) && (
                   <form
@@ -694,11 +846,13 @@ function CircuitFlow() {
                   deleteElements({
                     nodes:
                       elementMenu.targetType === "node"
-                        ? nodes.filter((node) => node.id === elementMenu.id)
+                        ? renderedNodes.filter(
+                            (node) => node.id === elementMenu.id,
+                          )
                         : [],
                     edges:
                       elementMenu.targetType === "edge"
-                        ? edges.filter((edge) => edge.id === elementMenu.id)
+                        ? liveEdges.filter((edge) => edge.id === elementMenu.id)
                         : [],
                   });
                   setElementMenu(null);
@@ -713,7 +867,7 @@ function CircuitFlow() {
                   saveConnectedComponent(
                     elementMenu.targetType === "node"
                       ? elementMenu.id
-                      : (edges.find((edge) => edge.id === elementMenu.id)
+                      : (liveEdges.find((edge) => edge.id === elementMenu.id)
                           ?.source as string),
                   )
                 }

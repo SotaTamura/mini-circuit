@@ -9,6 +9,7 @@ export type SavedComponent = {
   edges: import("@xyflow/react").Edge[];
   inputs: Port[];
   outputs: Port[];
+  sourceSeedNodeId?: string;
 };
 
 export function ComponentNode({ data }: NodeProps) {
