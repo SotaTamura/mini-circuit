@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="24 12 62 64" fill="white" role="img" aria-label="NOT gate">
+  <path d="M26 14L70 44L26 74V14Z" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>
+  <circle cx="78" cy="44" r="6" stroke="currentColor" fill="white" stroke-width="4"/>
+</svg>

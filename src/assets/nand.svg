@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="18 12 76 64" fill="white" role="img" aria-label="NAND gate">
+  <path d="M20 14H48C66 14 78 26 78 44S66 74 48 74H20V14Z" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>
+  <circle cx="86" cy="44" r="6" stroke="currentColor" fill="white" stroke-width="4"/>
+</svg>

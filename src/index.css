@@ -1,0 +1,33 @@
+@import "@xyflow/react/dist/style.css" layer(reactflow);
+@import "tailwindcss";
+
+.react-flow__handle {
+  width: 10px;
+  height: 10px;
+  background-color: black;
+}
+
+.react-flow__edge-path {
+  stroke-width: 4px;
+  stroke: black;
+}
+
+.react-flow__node-input,
+.react-flow__node-output {
+  width: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.react-flow__node-input.selectable:hover,
+.react-flow__node-output.selectable:hover,
+.react-flow__node-input.selectable.selected,
+.react-flow__node-output.selectable.selected,
+.react-flow__node-input.selectable:focus,
+.react-flow__node-output.selectable:focus {
+  box-shadow: none;
+}
+
